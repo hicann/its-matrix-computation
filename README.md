@@ -1,146 +1,373 @@
-## Ⅰ.SimNPU
+# its-matrix-computation（SimNPU）
 
-### 项目简介 ###
+> 面向昇腾 NPU 矩阵计算的性能仿真与分块策略搜索工具。
 
-<p>1. 摘要：这是一种基于微观典型矩阵计算模式的矩阵计算仿真算法。
+SimNPU 是 CANN 社区 Intelligent Transportation System SIG 维护的矩阵计算仿真项目。项目围绕昇腾 NPU 的 AI Core、多级存储、数据搬运和矩阵分块机制建立性能模型，在不依赖实际 NPU 设备的情况下，估算不同矩阵形状和分块配置下的执行周期与时延，并提供 `fast`、`bayes` 和 `exhaustive` 三种搜索模式。
 
-<p>2. 背景：大规模矩阵乘法是高性能计算与人工智能领域的核心计算内核，其效率直接决定大模型训练等应用的性能上限。专用 AI 加速器理论峰值算力虽高，但受“内存墙”影响，实测效率与理论值差距显著，传统静态优化策略难以适配复杂场景。通过构建硬件性能仿真模型，可在软件层面优化矩阵运算的计算与数据调度策略，充分释放昇腾等处理器的硬件潜能。
+## 项目概述
 
-<p>3. 方法：基于NPU多层硬件结构模型分批次建模算法模块：NPU多层硬件结构模块、矩阵分块策略、分批次调度机制、双缓冲数据传输优化、各层级带宽效率模型、计算与传输的延迟计算、FixPipe层的简化处理。随着深度学习模型对算力需求的指数级增长，NPU（神经网络处理器）作为专用加速硬件，其架构设计与运算效率的匹配性成为性能优化的核心。基于 NPU 多层硬件结构的分批次建模算法，通过精准建模硬件层级交互、矩阵分块策略与批次调度逻辑，可量化不同场景下的计算延迟与带宽利用率，为算子优化与硬件资源配置提供可靠的依据。该算法尤其关注矩阵运算中数据在多级存储与计算核心间的流动特性，通过分批次并行调度实现计算与传输的高效重叠，从而贴近真实硬件的执行行为。
+矩阵乘法是大模型训练、推理和高性能计算中的核心计算内核。实际执行效率不仅取决于理论峰值算力，还受到矩阵形状、分块策略、数据复用、多级存储容量、数据搬运带宽和调度方式等因素影响。
 
+SimNPU 通过软件仿真方式对上述因素进行建模，主要用于：
 
+- 分析不同矩阵形状下的计算与数据搬运开销；
+- 搜索满足存储和对齐约束的矩阵分块方案；
+- 比较不同循环顺序和调度策略的预计性能；
+- 为昇腾 NPU 上的 GEMM/GEMV 算子调优提供候选配置；
+- 在真实硬件测试前缩小配置搜索空间。
 
-- 3.1多层硬件结构建模NPU的硬件架构以 计算核心 + 多级存储 为核心约束： 
-    + 计算核心层：由 24 个达芬奇核心组成，每个核心包含 Cube 计算阵列，主要执行矩阵乘加操作。通过与真实 aic\_mac\_time 对比，计算效率拟合为 0.97，推测来自 L0 分块和调度带来的固定开销。 
-    + 片上缓存层：包含 L0 与 L1 两级缓存 L0 分为 L0A/L0B/L0C，容量分别为64KB/64KB/256KB，用于向计算核心提供输入 A/B 和暂存输出 C。 L1 为 1MB，承担 L0 与外部存储之间的数据缓冲，是分块策略的主要约束来源。 
-    + L2 层：在仿真中不展开结构，仅作为“带宽效率影响项”存在，通过预设的效率字典动态修正 DRAM→L1 的有效带宽。 外部存储（DRAM）：容量 64GB，基础带宽固定，但实际带宽由效率因子动态修正。
+> SimNPU 输出的是基于硬件配置和效率曲线得到的仿真估计结果，不能替代真实硬件测试、性能验收或硬件厂商正式结论。
 
-- 3.2 矩阵分块策略（Tiling） 
-     + 为满足各级缓存容量限制并提升复用，矩阵运算采用分层分块策略： L1 分块维度在 32～512 的 2 次幂范围内选择，优先选取可整除原矩阵维度的 tile，以减少边界填充开销
-     + 分块后的数据量需满足 L1 的双重约束： 子块总数据不超过 L1 的 50% L1 占用率不低于 60%（避免缓存浪费） L0 分块进一步对齐计算核心粒度（以 16×16 为基础 tile），通过组合拼接适配 L1 tile。 循环顺序支持多种遍历方式（如 mnk、kmn 等），不同顺序影响输入复用与传输压力，仿真会对其统一搜索。
+## 核心能力
 
-- 3.3 分批次调度机制（Batch Scheduling） 
-    + 由于计算核心数固定为 24，当分块数量超过 24 时采用分批调度： 以 L1 tile 为单位，每个 batch 选择 24 组 tile 映射到 24 个核心并行计算。 最后不足 24 组时仍按完整 batch 执行，未使用核心处于闲置，保持逻辑一致性。 
-    + 调度核心原则是 计算与数据读取重叠：上一批次计算过程中可并行读取下一批次数据，从而减少数据搬运暴露的等待时间。
+| 能力 | 说明 |
+|---|---|
+| NPU 多层硬件建模 | 对 AI Core、L0A/L0B/L0C、L1、L2 和外部存储等关键层级进行参数化描述 |
+| 分层矩阵分块 | 根据原始矩阵形状、缓存容量和对齐要求生成合法的 L1/L0 分块配置 |
+| 分批调度 | 将矩阵块映射到多个 AI Core，并估算完整批次和尾批次的执行过程 |
+| 双缓冲建模 | 模拟计算、预取和结果写回之间的重叠关系 |
+| 动态带宽效率 | 根据实际传输数据量查询效率曲线，计算不同存储路径上的有效带宽 |
+| 延迟估算 | 综合计算周期、数据读取、片上搬运和结果写回开销估算执行时延 |
+| Roofline 估算 | 针对矩阵向量等特殊场景提供 Roofline 参考结果 |
+| 三种搜索模式 | 支持快速候选搜索、贝叶斯优化搜索和合法配置穷举搜索 |
 
-- 3.4 双缓冲传输优化（Double Buffering） 
-    + DRAM↔L1 通路默认启用双缓冲机制（由硬件参数控制）： 当 batch n 计算时，提前预取 batch n+1 的数据到 L1 batch n 的写回可以与 batch n+1 的计算并行 因此传输延迟在多数情况下可被计算掩盖，仅在传输耗时超过计算耗时时才会暴露为额外延迟 当前 L1→L0A/L0B 仍采用串行方式，后续可进一步扩展为双缓冲以提升重叠程度。
-
-- 3.5 带宽效率查表模型（Efficiency Lookup） 
-    + 各层级带宽不采用固定值，而是依据传输数据量动态调整： DRAM→L1、L1→L0A、L1→L0B 分别对应不同效率字典文件 
-    + 查表方式为：根据传输数据量，选择字典中“不超过该数据量的最大档位”的效率因子 最终有效带宽为基础带宽乘以效率因子，并用于计算传输延迟 该机制用于刻画不同数据量下的实际带宽利用率差异，使仿真更贴近真实硬件表现。
-
-- 3.6 延迟计算与总周期估算 
-    仿真主要由两类延迟组成： 
-    + 计算延迟：由 tile 的运算量、核心数量、主频以及拟合的计算效率决定 
-    + 传输延迟：由数据量对齐、带宽效率查表及长突发提升等因素决定 对于特殊形状矩阵（如向量场景），采用 Roofline 思路估算总耗时；对于普通矩阵则按 batch 结构叠加计算/读取/写回阶段，得到总执行周期。
-
-- 3.7 FixPipe 层简化处理 
-    + FixPipe 主要涉及输出写回路径，耗时相对较短，对整体延迟影响有限，因此在模型中进行简化，仅保留关键写回成本，避免引入过多细节影响仿真效率。
-
-<p>4. 结果
-
-<img width="759" height="258" alt="image" src="https://github.com/user-attachments/assets/d57e18dd-16b5-440f-ae5c-394a0fa77f6f" />
-
-
-<img width="1020" height="123" alt="image" src="https://github.com/user-attachments/assets/0b77f5c7-78e1-4800-b594-5664a340f2b0" />
-
-### 目录结构说明 ###
+## 工作流程
 
 ```text
-SimNPU/
-├── src/                        # 核心源代码目录
-│   ├── new_matmul_threemode.py # 三模矩阵乘法核心逻辑实现
-│   ├── test_new_matmul_threemode.py # 算子测试与性能评估执行脚本
-│   ├── hardware.py             # NPU 硬件架构建模与参数定义
-│   ├── operators.py            # 计算算子（Operator）基类与定义
-│   ├── modules.py              # 通用功能模块与组件
-│   └── utils.py                # 辅助工具函数（数据解析、路径处理等）
-├── data/                       # 实验数据与配置文件
-│   ├── npu_910B1.json          # 目标硬件（如昇腾 910B1）规格配置文件
-│   ├── OUT2L1_efficiency.csv   # 算子效率分析数据（含 Roofline 模型数据）
-│   ├── 101 个矩阵_Input_Shapes.csv # 批量测试矩阵的维度定义表
-│   ├── 矩阵向量乘维度.csv        # 针对 GEMV 操作的维度定义
-│   └── I12L0A_efficiency.csv   # 不同流水级路径的效率测试记录
-├── image/                      # 性能可视化图表
-│   ├── image.png               # 算子性能分布图
-│   └── image-1.png             # 效率对比分析图1
-│   └── image-2.png             # 效率对比分析图2
-
-├── requirements.txt            # 项目 Python 依赖列表
-└── README.md                   # 项目使用说明文档
-
+矩阵形状（M、N、K）
+        +
+硬件配置与带宽效率曲线
+        │
+        ▼
+生成满足容量、边界和对齐约束的候选分块
+        │
+        ▼
+选择 fast / bayes / exhaustive 搜索模式
+        │
+        ▼
+执行分批调度、计算与传输时延仿真
+        │
+        ▼
+输出最优分块、循环顺序、周期和仿真时延
 ```
 
-### 代码文件说明 ###
+## 搜索模式
 
-**src/test\_new\_matmul\_threemode.py**: 测试执行入口。支持多进程并行测试多个矩阵形状（MNK），并输出 Roofline 估算与实际仿真搜索后的性能数据。
-    + 分三种模式（各一个分支）：
-一种是fast,mnk那些很少维度里选；
-一种是exhaustive,穷举16-16000（但是各维度L1 tile上限改成小于该维度（M/N/K的原始值）的16的倍数的最大值）；
-一种是bayes,16-16000的m,k,n的L1级分块使用贝叶斯（n\_calls默认为80）（但是各维度L1 tile上限改成小于该维度（M/N/K的原始值）的16的倍数的最大值）
+| 模式 | 搜索方式 | 适用场景 | 注意事项 |
+|---|---|---|---|
+| `fast` | 在预设的少量候选分块中快速搜索 | 快速验证、初步估算和调试 | 搜索速度快，但不保证覆盖全部合法配置 |
+| `bayes` | 在合法分块范围内进行贝叶斯优化 | 在搜索成本和结果质量之间取得平衡 | 依赖 `scikit-optimize`，结果受 `n_calls` 等参数影响 |
+| `exhaustive` | 穷举满足边界、容量和对齐要求的候选配置 | 小规模矩阵的最优性核对 | 搜索空间可能很大，不建议直接用于大矩阵全量搜索 |
 
-    + 使用方法
-```bash
-cd SimNPU/src
-```
+候选分块需满足代码中定义的缓存容量和数据对齐约束。L1 分块维度通常按 16 对齐，且不会超过原始矩阵对应的 M、N、K 维度上限。
 
-```bash
-python test_new_matmul_threemode.py --mode fast
-python test_new_matmul_threemode.py --mode bayes --n\_calls 100
-python test_new_matmul_threemode.py --mode exhaustive
-```
+## 版本与环境配套
 
-**src/hardware.py**: 硬件规格配置。定义了 AI Core 的核心数、时钟频率、各级存储（L1, L2, L0, UB 等）的容量、最小访问粒度以及各级路径的理论带宽和模拟效率曲线。它是整个仿真系统的硬件基础。
+SimNPU 是 Python 仿真程序，正常运行不要求安装 CANN Toolkit，也不要求连接实际 NPU 设备。仓库当前提供的默认硬件配置面向昇腾 910B1。
 
-**src/modules.py**: 底层仿真模块。实现了计算模块（ComputeModule）、IO 传输模块（IOModule）和缓存管理模块（L2CacheManager）。通过线性插值等方式模拟实际硬件在不同负载下的效率表现。
+| 项目 | 要求或说明 |
+|---|---|
+| 源码分支 | `master` |
+| Python | 3.9 及以上 |
+| 默认仿真目标 | 昇腾 910B1 |
+| 默认硬件配置 | `data/npu_910B1.json` |
+| CANN Toolkit | 非运行必需；本项目不直接调用 CANN Runtime |
+| 实际 NPU | 非运行必需 |
+| Python 依赖 | 以 `requirements.txt` 为准 |
 
-**src/new\_matmul\_threemode.py**: 核心算子实现。包含了 Matmul 类及其性能仿真模型。它能够根据硬件参数计算 Roofline 模型估算值，并通过 simulate 方法详细模拟矩阵分块（Tiling）在硬件上的执行周期。支持三种搜索最佳分块策略的模式：fast、exhaustive 和 bayes。
+已验证环境：
 
-**src/operators.py**: 算子基类定义。定义了所有算子的通用基类 Operator，并实现了基础的张量变换算子，如 Reshape（形状变换）、Concat（张量拼接）和 Transpose（维度转置），用于构建计算图。
+| 环境项 | 已验证配置 |
+|---|---|
+| 操作系统 | Debian GNU/Linux 13 |
+| 系统架构 | x86_64 |
+| Python | 3.13.5 |
+| NumPy | 2.5.1 |
+| Pandas | 3.0.3 |
+| scikit-optimize | 0.10.2 |
 
-**src/utils.py**: 基础工具库。定义了 Tensor 类和 DataType（如 fp16, int8）等基础数据结构，并提供了计算张量大小、查找约数等辅助函数。
+如新增其他昇腾硬件配置，应同步提供硬件参数来源、字段说明、效率曲线及相应验证结果。
 
-### 数据与配置文件说明 ###
+## 环境准备
 
-1. 性能效率曲线 (CSV 文件)
-这些文件用于 new\_matmul\_threemode.py 中的仿真逻辑，通过查找不同数据量（Traffic Size）对应的效率因子，使仿真结果更贴近真实硬件表现：
-
-   `data/OUT2L1\_efficiency.csv`: 用于模拟 DRAM 到 L1 缓存（或输出写回）的带宽效率曲线。
-
-   `data/OUT2L1\_efficiency - roofline.csv`: 专门用于 Roofline 模型计算时参考的带宽效率数据。
-
-   `data/l12L0A\_efficiency.csv`: 模拟数据从 L1 缓存搬运到计算单元 L0A 缓冲区时的效率。
-
-   `data/l12L0B\_efficiency.csv`: 模拟数据从 L1 缓存搬运到计算单元 L0B 缓冲区时的效率。
-
-2. 测试任务与维度 (CSV 文件)
-这些文件定义了用于性能评估的矩阵形状（M, N, K）：
-
-   `data/101 个矩阵\_Input\_Shapes.csv`: 包含 101 组典型的矩阵乘法维度，用于大批量自动化测试。
-   
-   `data/矩阵向量乘维度.csv`: 专门针对矩阵-向量乘（GEMV）场景的测试维度定义。
-
-3. 硬件规格 (JSON 文件)
-
-   `data/npu\_910B1.json`: 包含了昇腾 NPU (910B1) 的详细硬件参数定义（如频率、带宽、各级存储容量等），可供仿真器加载或作为硬件配置参考。
-
-### 测试执行模式 ###
+建议在 Python 虚拟环境中安装依赖：
 
 ```bash
-cd SimNPU/src
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
+
+Windows PowerShell 可使用：
+
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+## ⬇ 源码下载
 
 ```bash
-python test_new_matmul_threemode.py --mode fast
-python test_new_matmul_threemode.py --mode bayes --n\_calls 100
-python test_new_matmul_threemode.py --mode exhaustive
+git clone https://gitcode.com/cann/its-matrix-computation.git
+cd its-matrix-computation
 ```
 
-### 环境依赖 ###
+如需复现实验或测试结果，请记录所使用的分支和 Commit ID。
 
-Python 3.9+
+## 快速入门
 
-其它见`requirements.txt`
+### 1. 代码语法检查
 
----
+```bash
+python -m py_compile src/*.py
+```
+
+### 2. Fast 模式
+
+```bash
+python src/test_new_matmul_threemode.py --mode fast
+```
+
+### 3. Bayes 模式
+
+```bash
+python src/test_new_matmul_threemode.py --mode bayes --n_calls 100
+```
+
+`n_calls` 用于设置贝叶斯搜索调用次数。增加调用次数通常会扩大搜索过程，但也会增加运行时间。
+
+### 4. Exhaustive 模式
+
+```bash
+python src/test_new_matmul_threemode.py --mode exhaustive
+```
+
+穷举模式的运行时间随矩阵规模和合法分块数量快速增长，建议先使用小规模矩阵验证。
+
+### 5. 查看参数说明
+
+```bash
+python src/test_new_matmul_threemode.py --help
+```
+
+## 输入与输出
+
+### 默认示例输入
+
+当前测试入口的默认矩阵为：
+
+```text
+A: [1096, 1600]
+B: [1600, 1096]
+```
+
+对应矩阵乘法：
+
+```text
+[1096, 1600] × [1600, 1096]
+```
+
+### 主要输出
+
+程序根据运行模式输出以下信息：
+
+- 矩阵形状；
+- 搜索模式；
+- 候选或最优 L1 分块；
+- 循环顺序；
+- Roofline 参考结果；
+- 仿真执行周期；
+- 仿真时延。
+
+仓库同时提供典型 GEMM 和 GEMV 矩阵维度文件，可用于扩展批量测试。当前测试入口默认执行单个示例矩阵；使用批量矩阵时，应根据脚本中的批量测试逻辑启用相应入口，并确认每个输入均产生独立结果。
+
+## 已验证结果
+
+以下结果来自 2026 年 7 月 6 日的功能测试。不同代码版本、输入矩阵、搜索次数和硬件参数可能产生不同结果。
+
+| 测试项 | 输入或配置 | 结果 |
+|---|---|---|
+| Python 语法检查 | `python -m py_compile src/*.py` | 所有 Python 文件编译通过 |
+| Fast 模式 | 默认矩阵 | 仿真时延 `15.432770 μs` |
+| Bayes 模式 | 默认矩阵，`n_calls=15` | 最优分块 `(592, 288, 64)`，循环顺序 `nmk`，仿真时延 `14.696216 μs` |
+| Exhaustive 模式 | `256×256` 与 `256×256` | 搜索 24,576 个候选组合，仿真时延 `2.159570 μs` |
+
+上述结果用于说明程序能够正常执行，不代表所有矩阵形状下的性能或精度结论。
+
+## 仿真模型
+
+### 多层硬件结构
+
+仿真模型以 AI Core 和多级存储层次为核心，包括：
+
+- AI Core 与 Cube 矩阵计算单元；
+- L0A、L0B 和 L0C 片上缓冲区；
+- L1 缓存；
+- L2 相关带宽影响；
+- 外部存储与结果写回路径。
+
+硬件核心数量、频率、存储容量、访问粒度和理论带宽等参数由配置文件加载。
+
+### 矩阵分块与调度
+
+矩阵乘法会按照硬件容量和对齐约束生成分块方案。仿真过程综合考虑：
+
+- L1 和 L0 分块；
+- M、N、K 边界；
+- 16×16 等基础计算粒度；
+- 输入数据复用；
+- 不同循环顺序；
+- 多核并行批次；
+- 尾批次中的空闲核心。
+
+### 双缓冲与传输
+
+模型可描述计算、下一批数据预取和上一批结果写回之间的重叠。只有无法被计算过程掩盖的传输时间才会作为额外开销计入总时延。
+
+### 动态带宽效率
+
+DRAM→L1、L1→L0A 和 L1→L0B 等路径不直接使用固定峰值带宽，而是根据传输数据量查询对应的效率曲线，再计算有效带宽和传输时延。
+
+### 总时延
+
+总时延主要由以下部分构成：
+
+- 矩阵计算开销；
+- 输入读取开销；
+- 片上数据搬运开销；
+- 结果写回开销；
+- 批次调度和边界处理开销。
+
+FixPipe 写回路径在当前模型中采用简化处理，仅保留主要成本。
+
+## 目录结构
+
+```text
+its-matrix-computation/
+├── src/
+│   ├── new_matmul_threemode.py       # Matmul 仿真与三种分块搜索逻辑
+│   ├── test_new_matmul_threemode.py  # 测试和性能评估入口
+│   ├── hardware.py                   # NPU 硬件结构与参数加载
+│   ├── modules.py                    # 计算、IO 与缓存等仿真模块
+│   ├── operators.py                  # Operator 基类与基础张量算子
+│   └── utils.py                      # Tensor、DataType 和辅助函数
+├── data/
+│   ├── npu_910B1.json                # 昇腾 910B1 硬件配置
+│   ├── OUT2L1_efficiency.csv         # DRAM/OUT 到 L1 的带宽效率曲线
+│   ├── OUT2L1_efficiency - roofline.csv
+│   │                                  # Roofline 使用的带宽效率数据
+│   ├── l12L0A_efficiency.csv         # L1 到 L0A 的带宽效率曲线
+│   ├── l12L0B_efficiency.csv         # L1 到 L0B 的带宽效率曲线
+│   ├── 101 个矩阵_Input_Shapes.csv   # 典型 GEMM 矩阵形状
+│   └── 矩阵向量乘维度.csv             # GEMV 测试矩阵形状
+├── image/                             # 结果图和说明图片
+├── requirements.txt                   # Python 依赖
+├── CONTRIBUTING.md                    # 贡献指南
+├── SECURITY.md                        # 安全声明
+├── CHANGELOG.md                       # 版本变更记录
+├── LICENSE                            # 开源许可证
+└── README.md                          # 项目说明
+```
+
+> 文件名区分大小写。Linux 环境下请使用仓库中的实际文件名，例如 `l12L0A_efficiency.csv`，避免将小写字母 `l` 误写为大写字母 `I`。
+
+## 核心文件说明
+
+### `src/new_matmul_threemode.py`
+
+实现 `Matmul` 仿真模型、Roofline 估算以及 `fast`、`bayes`、`exhaustive` 三种分块搜索逻辑。
+
+### `src/test_new_matmul_threemode.py`
+
+项目测试和性能评估入口。默认执行一个矩阵乘法示例，并可根据脚本中的任务定义扩展为典型矩阵或 GEMV 批量测试。
+
+### `src/hardware.py`
+
+加载和描述 AI Core 数量、时钟频率、多级存储容量、访问粒度、理论带宽和效率曲线等硬件参数。
+
+### `src/modules.py`
+
+实现计算模块、IO 传输模块和缓存管理等底层仿真组件。
+
+### `src/operators.py`
+
+定义算子通用基类，并提供 `Reshape`、`Concat` 和 `Transpose` 等基础张量操作。
+
+### `src/utils.py`
+
+定义 `Tensor`、`DataType` 等数据结构，以及张量大小计算、约数查找等辅助方法。
+
+## 数据与配置
+
+### 硬件配置
+
+`data/npu_910B1.json` 保存默认仿真目标的硬件参数。修改配置前应确认字段单位、参数来源和合理范围。
+
+### 带宽效率曲线
+
+以下文件用于根据数据传输规模计算有效带宽：
+
+- `data/OUT2L1_efficiency.csv`
+- `data/OUT2L1_efficiency - roofline.csv`
+- `data/l12L0A_efficiency.csv`
+- `data/l12L0B_efficiency.csv`
+
+修改效率数据时，应保留原始测量依据，并重新验证仿真结果。
+
+### 测试矩阵
+
+- `data/101 个矩阵_Input_Shapes.csv`：典型 GEMM 矩阵形状；
+- `data/矩阵向量乘维度.csv`：GEMV 场景矩阵形状。
+
+## 已知限制
+
+- 当前仓库默认提供昇腾 910B1 硬件配置，其他硬件需要补充配置和效率数据；
+- 仿真精度依赖硬件参数和效率曲线的准确性；
+- `exhaustive` 模式在大矩阵上可能产生较高的时间和内存开销；
+- Bayes 搜索结果受调用次数和搜索过程影响；
+- 当前测试入口默认执行单个矩阵示例，批量数据文件不会在默认命令中自动全部执行；
+- README 中的示例结果不能替代逐样本日志、误差统计和真实硬件对比。
+
+## 参与贡献
+
+欢迎提交 Bug 修复、搜索策略、硬件配置、效率曲线、测试用例和文档改进。
+
+提交贡献前，请阅读：
+
+- [贡献指南](CONTRIBUTING.md)
+- [安全声明](SECURITY.md)
+- [变更记录](CHANGELOG.md)
+- [开源许可证](LICENSE)
+
+基本流程：
+
+1. 创建或关联 Issue；
+2. Fork 仓库并创建独立分支；
+3. 完成代码、测试和文档修改；
+4. 提交可复现的测试命令与结果；
+5. 发起 Pull Request；
+6. 根据检视意见完成闭环。
+
+涉及性能或精度结论的 PR，应同时提供测试环境、Commit ID、输入矩阵、对照方法、原始结果和统计口径。
+
+## 所属 SIG
+
+本项目属于 CANN 社区 [Intelligent Transportation System SIG](https://gitcode.com/cann/community/blob/master/CANN/sigs/intelligent-transportation-system/README.md)。
+
+该 SIG 聚焦交通大数据分析、交通网络优化计算和交通大模型智能决策等场景，推动交通行业相关算子、工具链和示例应用在 CANN 生态中建设与落地。
+
+## 问题反馈与社区交流
+
+- [提交 Issue](https://gitcode.com/cann/its-matrix-computation/issues)
+- [查看 Pull Requests](https://gitcode.com/cann/its-matrix-computation/pulls)
+- [CANN 社区](https://gitcode.com/cann/community)
+- [Intelligent Transportation System SIG](https://gitcode.com/cann/community/blob/master/CANN/sigs/intelligent-transportation-system/README.md)
+
+提交问题时，请提供代码版本、运行环境、执行命令、输入矩阵、完整错误信息和最小复现步骤。
+
+## 许可证
+
+本项目采用仓库根目录 [`LICENSE`](LICENSE) 中声明的开源许可证。使用、修改和分发本项目代码前，请阅读并遵守相应许可条款。
