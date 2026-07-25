@@ -1,3 +1,12 @@
+<!--
+Copyright (c) 2026 Southeast University.
+This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+CANN Open Software License Agreement Version 2.0 (the "License").
+Please refer to the License for details. You may not use this file except in compliance with the License.
+THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+See LICENSE in the root of the software repository for the full text of the License.
+-->
 # Contributing to SimNPU
 
 感谢你对 SimNPU 的关注与贡献。SimNPU 是面向 NPU 矩阵计算的性能仿真工具，支持硬件配置加载、矩阵分块与调度建模，以及 `fast`、`bayes`、`exhaustive` 三种矩阵乘搜索模式。
